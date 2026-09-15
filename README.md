@@ -109,21 +109,34 @@ never talks to Keycloak, never handles tokens, never stores secrets.
 2. ARCHITECTURE
 ================================================================================
 
-    Browser  -->  Nuxt (localhost:3000)
-                    |
-                    | GET  /api/user     (session cookie)
-                    | POST /api/logout   (session cookie)
-                    | GET  /sso/redirect (browser navigation)
-                    v
-                  Laravel (localhost:8000)
-                    |
-                    | OIDC Authorization Code + PKCE
-                    v
-                  Keycloak (localhost:9000)
-                    |
-                    v
-                  users table (SQLite)
-                  sessions table (SQLite)
+Browser
+   |
+   | --> Nuxt (localhost:3000)
+   |
+   |     GET  /api/user
+   |          (session cookie)
+   |
+   |     POST /api/logout
+   |          (session cookie)
+   |
+   |     GET  /sso/redirect
+   |          (browser navigation)
+   |
+   v
+Laravel (localhost:8000)
+   |
+   |  OIDC Authorization Code + PKCE
+   |
+   v
+Keycloak (localhost:9000)
+   |
+   v
+SQLite Database
+   |
+   +-- users table
+   |
+   +-- sessions table
+
 
 Two independent sessions exist:
 
