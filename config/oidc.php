@@ -1,0 +1,90 @@
+<?php
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cache configuration
+    |--------------------------------------------------------------------------
+    |
+    | The discovery document and JWKS responses are cached to avoid hitting
+    | the IdP on every request. Set "store" to null to use the default cache
+    | store, or to a specific store name defined in config/cache.php.
+    |
+    */
+
+    'cache' => [
+        'discovery_ttl' => 3600,
+        'jwks_ttl' => 21600,
+        'store' => null,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | HTTP client configuration
+    |--------------------------------------------------------------------------
+    */
+
+    'http' => [
+        'timeout' => 5,
+        'connect_timeout' => 3,
+
+        /*
+        | Issuer and JWKS URLs must use HTTPS to prevent transport downgrade and
+        | SSRF attacks. Enable this only for local development against an IdP
+        | served over plain HTTP. Never enable it in production.
+        */
+        'allow_insecure_urls' => env('OIDC_ALLOW_INSECURE_URLS', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | JWT validation
+    |--------------------------------------------------------------------------
+    |
+    | Clock skew is the maximum allowed difference (in seconds) between the
+    | server clock and the IdP clock when validating exp/iat.
+    |
+    | Symmetric algorithms such as HS256 are intentionally not allowed by default.
+    |
+    | Specifying key algorithm is optional for the server in a KTY,
+    | but it is required for parsing in this library. Use the 'default_algorithm'
+    | in case of 'JWK must contain an "alg" parameter' error.
+    */
+
+    'jwt' => [
+        'leeway_seconds' => 60,
+        'allowed_algorithms' => ['RS256', 'RS384', 'RS512', 'ES256', 'ES384'],
+        'default_algorithm' => null,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Default (single-tenant) configuration
+    |--------------------------------------------------------------------------
+    |
+    | This block is used as a fallback when no OidcConfig is supplied through
+    | setConfig() at runtime. Fine for single-tenant apps; for multi-tenant
+    | apps, prefer building OidcConfig from your tenant model.
+    |
+    */
+
+    'default' => [
+        'issuer_url' => env('OIDC_ISSUER_URL'),
+        'client_id' => env('OIDC_CLIENT_ID'),
+        'client_secret' => env('OIDC_CLIENT_SECRET'),
+        'redirect_uri' => env('OIDC_REDIRECT_URI'),
+        'scopes' => ['openid', 'email', 'profile'],
+
+        /*
+        | Some providers expose non-standard claim names. Map any of the user
+        | fields (id, nickname, name, email, avatar) to the claim that holds it.
+        | Unmapped fields keep the standard OIDC claims (sub, preferred_username,
+        | name, email, picture).
+        |
+        | 'user_field_mappings' => ['email' => 'mail'],
+        */
+        'user_field_mappings' => [],
+    ],
+
+];
