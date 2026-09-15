@@ -10,22 +10,21 @@ The Nuxt SPA never communicates directly with Keycloak and never receives, store
 
 This architecture keeps all OIDC tokens and authentication logic on the server while providing the Nuxt SPA with a simple, secure session-based authentication interface.
 
-Architecture
-Browser
-   │
-   ├───────────────┐
-   │               │
-   ▼               ▼
-Nuxt SPA       Laravel 12 BFF
-                   │
-                   │ OpenID Connect
-                   ▼
-                Keycloak
-                   │
-                   ▼
-             Local User DB
+================================================================================
+ARCHITECTURE
+================================================================================
 
-Authentication flow
+```mermaid
+flowchart TD
+    A[Browser] --> B[Nuxt SPA]
+    A --> C[Laravel 12 BFF]
+    C -->|OpenID Connect| D[Keycloak]
+    D --> E[Local User DB]
+```
+
+================================================================================
+AUTHENTICATION FLOW
+================================================================================
 
 The user starts login from the Nuxt SPA.
 
@@ -47,7 +46,9 @@ The SPA calls /api/user using the session cookie.
 
 Laravel resolves and returns the authenticated user.
 
-Security model
+================================================================================
+SECURITY MODEL
+================================================================================
 
 Keycloak owns authentication and passwords.
 
@@ -63,7 +64,9 @@ Session-based authentication is handled through Laravel Sanctum.
 
 Federated logout terminates both the Laravel and Keycloak sessions.
 
-Tech Stack
+================================================================================
+TECH STACK
+================================================================================
 
 Backend: Laravel 12, PHP, Laravel Sanctum
 Identity: Keycloak, OpenID Connect, OAuth 2.0
