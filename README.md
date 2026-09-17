@@ -909,5 +909,15 @@ Rule 7 — Session cookies must be HttpOnly and Secure
                   documentation for the Keycloak setup.
 
 ================================================================================
+14. AUTHOR
+================================================================================
+
+This project was developed by **Tochukwu Uchem**.
+
+- **Github:** https://github.com/uchemcolin
+- **Linkedin:** https://www.linkedin.com/in/tochukwu-uchem-802888144/
+- **Gitlab:** https://gitlab.com/uchemcolin
+
+================================================================================
 END OF DOCUMENT
 ================================================================================
