@@ -3,16 +3,20 @@
 namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
+use App\Models\AuditLog;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Laravel\Socialite\Facades\Socialite;
 
 class OidcController extends Controller
 {
     /**
-     * Kick off the OIDC redirect to Keycloak.
+     * Kick off the OIDC authorization code flow.
      */
     public function redirect()
     {
@@ -23,6 +27,12 @@ class OidcController extends Controller
 
     /**
      * Handle the callback from Keycloak.
+     *
+     * The user is authenticated by Keycloak, then a Laravel
+     * Sanctum personal access token is created.
+     *
+     * The actual token is NOT placed in the redirect URL.
+     * Instead, a short-lived one-time exchange code is created.
      */
     public function callback(Request $request)
     {
@@ -33,222 +43,241 @@ class OidcController extends Controller
                 'message' => $e->getMessage(),
             ]);
 
-            return redirect(config('app.frontend_url') . '/login?error=auth_failed');
+            return redirect(
+                config('app.frontend_url') . '/login?error=auth_failed'
+            );
         }
 
-        // The key mapping: issuer + subject uniquely identifies the user
-        $issuer  = config('oidc.default.issuer_url');
-        $subject = $oidcUser->getId();    // the 'sub' claim
+        $issuer = $this->getIssuerUrl();
+        $subject = $oidcUser->getId();
 
-        $user = User::updateOrCreate(
-            [
+        if (empty($issuer) || empty($subject)) {
+            Log::error('OIDC callback: missing issuer or subject');
+
+            return redirect(
+                config('app.frontend_url') . '/login?error=invalid_identity'
+            );
+        }
+
+        /*
+         * The OIDC issuer + subject uniquely identifies the local user.
+         *
+         * This deliberately preserves the identity mapping from your
+         * original controller.
+         */
+        try {
+            $user = User::updateOrCreate(
+                [
+                    'oidc_issuer'  => $issuer,
+                    'oidc_subject' => $subject,
+                ],
+                [
+                    'name'  => $oidcUser->getName() ?? 'OIDC User',
+                    'email' => $oidcUser->getEmail(),
+                ]
+            );
+        } catch (\Throwable $e) {
+            Log::error('OIDC user create/update failed', [
+                'message'      => $e->getMessage(),
+                'exception'    => get_class($e),
                 'oidc_issuer'  => $issuer,
                 'oidc_subject' => $subject,
-            ],
+            ]);
+
+            return redirect(
+                config('app.frontend_url') .
+                '/login?error=user_create_update_failed'
+            );
+        }
+
+        /*
+         * Do NOT use Auth::login() here.
+         *
+         * Authentication for the Nuxt application is now handled
+         * through a Sanctum personal access token.
+         */
+
+        /*
+         * Create the personal access token.
+         *
+         * Sanctum stores only a hashed representation of the token.
+         * The plain-text token is available here and only here.
+         */
+        $token = $user
+            ->createToken('nuxt-app', ['*'])
+            ->plainTextToken;
+
+        /*
+         * Generate a short-lived, one-time exchange code.
+         *
+         * The real Sanctum token is never exposed in the browser URL.
+         */
+        $exchangeCode = Str::random(64);
+
+        Cache::put(
+            'oidc_exchange:' . hash('sha256', $exchangeCode),
             [
-                'name'  => $oidcUser->getName() ?? 'OIDC User',
-                'email' => $oidcUser->getEmail(),
-            ]
+                'token'   => $token,
+                'user_id' => $user->id,
+            ],
+            now()->addMinute()
         );
 
-        Auth::login($user, true);
-        $request->session()->regenerate();
+        /*
+         * Record the successful login.
+         */
+        AuditLog::record('voter_login', $user->ir_no ?? null, [
+            'email'        => $user->email,
+            'oidc_subject' => $user->oidc_subject,
+        ]);
 
-        // Redirect the browser back to Nuxt
-        return redirect(config('app.frontend_url') . '/dashboard');
+        /*
+         * Redirect to Nuxt.
+         *
+         * Only the short-lived exchange code is placed in the URL.
+         */
+        return redirect(
+            config('app.frontend_url') .
+            '/oauth/callback?code=' .
+            urlencode($exchangeCode)
+        );
     }
 
     /**
-     * Return the currently authenticated user as JSON.
+     * Exchange the short-lived OIDC authentication code for
+     * the Laravel Sanctum personal access token.
+     */
+    public function exchangeToken(Request $request)
+    {
+        $request->validate([
+            'code' => ['required', 'string'],
+        ]);
+
+        $key = 'oidc_exchange:' .
+            hash('sha256', $request->input('code'));
+
+        /*
+         * Cache::pull() retrieves AND deletes the value.
+         *
+         * Therefore the exchange code can only be used once.
+         */
+        $data = Cache::pull($key);
+
+        if (! $data) {
+            return response()->json([
+                'message' => 'Invalid or expired authentication code.',
+            ], 401);
+        }
+
+        return response()->json([
+            'token' => $data['token'],
+        ]);
+    }
+
+    /**
+     * Return the currently authenticated user.
+     *
+     * Authentication is provided by Sanctum through the Bearer token.
      */
     public function user(Request $request)
     {
         return response()->json($request->user());
     }
 
-     /**
-     * Log the user out of the Laravel application and construct
-    * the OIDC/Keycloak logout URL for the frontend.
-    *
-    * IMPORTANT:
-    * This method immediately logs the user out of the local
-    * Laravel application/session.
-    *
-    * It does NOT directly log the user out of the OIDC/Keycloak
-    * SSO session. Instead, it discovers Keycloak's end-session
-    * endpoint and returns a logout URL to the frontend.
-    *
-    * The frontend must redirect the user's browser to the
-    * returned logout_url for the Keycloak/SSO logout to actually
-    * take place.
-    */
+    /**
+     * Log the user out of Laravel/Sanctum and construct the
+     * Keycloak federated logout URL.
+     *
+     * The current Sanctum personal access token is revoked immediately.
+     *
+     * Keycloak logout is completed by the browser redirecting to
+     * the returned logout_url.
+     */
     public function logout(Request $request)
     {
         /*
-        * Log the user out of Laravel's local authentication session.
-        *
-        * The 'web' guard is the session-based authentication guard
-        * used by the application.
-        *
-        * This logs the user out of the Laravel application itself.
-        * It does NOT log the user out of Keycloak/SSO.
-        */
-        Auth::guard('web')->logout();
+         * Revoke only the token that authenticated this request.
+         */
+        $request->user()
+            ?->currentAccessToken()
+            ?->delete();
 
-        /*
-        * Invalidate the current Laravel session so that the existing
-        * session can no longer be used.
-        */
-        $request->session()->invalidate();
-
-        /*
-        * Generate a new CSRF token after invalidating the session.
-        *
-        * This ensures the application does not continue using the
-        * previous session's CSRF token.
-        */
-        $request->session()->regenerateToken();
-
-        /*
-        * Start with no Keycloak logout URL.
-        *
-        * If Keycloak is unavailable or its discovery document does
-        * not contain an end-session endpoint, the user will still
-        * be logged out of Laravel. In that case, this remains null.
-        */
         $logoutUrl = null;
 
         try {
-            /*
-            * Get the OIDC issuer URL.
-            *
-            * This is typically the base URL of the Keycloak realm,
-            * for example:
-            *
-            * https://keycloak.example.com/realms/my-realm
-            */
-            $issuer = config('oidc.default.issuer_url');
+            $issuer = $this->getIssuerUrl();
+            $clientId = $this->getClientId();
 
-            /*
-            * Get the OIDC client ID used by this application.
-            */
-            $clientId = config('oidc.default.client_id');
-
-            /*
-            * Only attempt Keycloak logout URL construction if the
-            * required OIDC configuration values are available.
-            */
             if ($issuer && $clientId) {
-
                 /*
-                * Request the OIDC discovery document from Keycloak.
-                *
-                * The discovery document contains the provider's
-                * supported OIDC endpoints, including the endpoint
-                * used to perform logout.
-                *
-                * The 5-second timeout prevents the logout request
-                * from hanging indefinitely if Keycloak is unavailable.
-                */
-                $response = \Illuminate\Support\Facades\Http::timeout(5)
-                    ->get($issuer . '/.well-known/openid-configuration');
+                 * Discover the OIDC end-session endpoint.
+                 */
+                $response = Http::timeout(5)
+                    ->get(
+                        rtrim($issuer, '/') .
+                        '/.well-known/openid-configuration'
+                    );
 
-                /*
-                * Only process the discovery document if Keycloak
-                * returned a successful HTTP response.
-                */
                 if ($response->successful()) {
-
-                    /*
-                    * Get Keycloak's OIDC end-session endpoint.
-                    *
-                    * This is the endpoint that can be used to
-                    * terminate the user's Keycloak/SSO session.
-                    *
-                    * IMPORTANT:
-                    * We are only retrieving the endpoint here.
-                    * We have NOT called the logout endpoint itself.
-                    */
-                    $endSessionEndpoint = $response->json('end_session_endpoint');
+                    $endSessionEndpoint = $response->json(
+                        'end_session_endpoint'
+                    );
 
                     if ($endSessionEndpoint) {
-
                         /*
-                        * Build the query parameters for the Keycloak
-                        * logout URL.
-                        *
-                        * post_logout_redirect_uri:
-                        * --------------------------------
-                        * Tells Keycloak where the user's browser
-                        * should be redirected after Keycloak logout.
-                        *
-                        * client_id:
-                        * --------------------------------
-                        * Identifies the OIDC client/application
-                        * requesting the logout.
-                        */
+                         * Tell Keycloak where to send the browser
+                         * after the federated logout completes.
+                         */
                         $params = http_build_query([
-                            'post_logout_redirect_uri' => config('app.frontend_url'),
+                            'post_logout_redirect_uri' =>
+                                config('app.frontend_url'),
+
                             'client_id' => $clientId,
                         ]);
 
-                        /*
-                        * Construct the complete Keycloak logout URL.
-                        *
-                        * IMPORTANT:
-                        * This only constructs the URL. Laravel is
-                        * NOT making a request to this endpoint.
-                        *
-                        * The frontend must redirect the user's
-                        * browser to this URL for Keycloak to process
-                        * the SSO logout.
-                        */
-                        $logoutUrl = $endSessionEndpoint . '?' . $params;
+                        $logoutUrl =
+                            $endSessionEndpoint . '?' . $params;
                     }
                 }
             }
         } catch (\Throwable $e) {
-
             /*
-            * If Keycloak is unavailable, the discovery request
-            * fails, or another error occurs while constructing
-            * the logout URL, log the error.
-            *
-            * The local Laravel logout has already happened above,
-            * so we do not want a Keycloak problem to prevent the
-            * user from being logged out of the Laravel application.
-            */
-            \Illuminate\Support\Facades\Log::error(
-                'Logout URL construction failed',
-                [
-                    'message' => $e->getMessage(),
-                ]
-            );
+             * The Sanctum token has already been revoked.
+             *
+             * A Keycloak discovery failure should therefore not
+             * prevent the application logout from succeeding.
+             */
+            Log::error('Logout URL construction failed', [
+                'message' => $e->getMessage(),
+            ]);
         }
 
-        /*
-        * Return the result to the frontend.
-        *
-        * At this point:
-        *
-        * 1. The user has been logged out of Laravel.
-        * 2. The Laravel session has been invalidated.
-        * 3. A new CSRF token has been generated.
-        * 4. $logoutUrl contains a Keycloak logout URL if one
-        *    could be successfully constructed.
-        *
-        * IMPORTANT:
-        * Returning logout_url does NOT log the user out of
-        * Keycloak automatically.
-        *
-        * The frontend must explicitly redirect the browser to
-        * logout_url if it wants to terminate the Keycloak/SSO
-        * session as well.
-        */
         return response()->json([
-            'message' => 'Logged out',
+            'message'    => 'Logged out',
             'logout_url' => $logoutUrl,
         ]);
     }
 
+    /**
+     * Read the OIDC issuer URL regardless of the configuration
+     * nesting used by the Socialite OIDC package.
+     */
+    private function getIssuerUrl(): ?string
+    {
+        return config('oidc.default.issuer_url')
+            ?? config('oidc.providers.oidc.issuer_url')
+            ?? config('oidc.issuer_url')
+            ?? env('OIDC_ISSUER_URL');
+    }
+
+    /**
+     * Read the OIDC client ID.
+     */
+    private function getClientId(): ?string
+    {
+        return config('oidc.default.client_id')
+            ?? config('oidc.providers.oidc.client_id')
+            ?? config('oidc.client_id')
+            ?? env('OIDC_CLIENT_ID');
+    }
 }

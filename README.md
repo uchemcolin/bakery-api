@@ -2,267 +2,866 @@
 BAKERY API — Laravel 12 + Keycloak (OIDC BFF)
 ================================================================================
 
-A secure Laravel 12 API that acts as both an OpenID Connect (OIDC) client and Backend-for-Frontend (BFF) for a Nuxt 4 single-page application (SPA), using Keycloak as the identity provider.
+A secure Laravel 12 API that acts as both an OpenID Connect (OIDC) client and
+Backend-for-Frontend (BFF) for a Nuxt 4 single-page application (SPA), using
+Keycloak as the identity provider.
 
-Laravel handles the entire OIDC authentication flow, including initiating login, exchanging the OIDC authorization code for tokens, mapping the external Keycloak identity to a local user, and creating and managing the authenticated server-side Laravel session. The API also serves as the resource server for the Nuxt frontend.
+Laravel handles the server-side authentication responsibilities, including:
 
-The Nuxt SPA never communicates directly with Keycloak and never receives, stores, or processes OIDC access tokens, ID tokens, or refresh tokens. It stores no authentication secrets and has no responsibility for the OIDC flow. Instead, it communicates exclusively with the Laravel BFF and can call endpoints such as /api/user to retrieve the currently authenticated user. Laravel returns the authenticated user when a valid server-side session exists, or 401 Unauthorized when the user is not authenticated.
+- Communicating with Keycloak using OpenID Connect.
+- Exchanging the authorization code for OIDC tokens.
+- Validating the OIDC identity.
+- Mapping the external Keycloak identity to a local user.
+- Creating and managing the authenticated Laravel session.
+- Returning the authenticated user to the Nuxt SPA.
+- Building the Keycloak federated logout URL.
+- Protecting application API routes through Laravel Sanctum.
 
-This architecture keeps all OIDC tokens and authentication logic on the server while providing the Nuxt SPA with a simple, secure session-based authentication interface.
+The Nuxt SPA does not communicate directly with Keycloak.
+
+The SPA may receive the authorization callback containing the temporary OIDC
+authorization code, but it does not exchange that code itself and never
+receives, stores, or processes OIDC access tokens, ID tokens, refresh tokens,
+or the Keycloak client secret.
+
+The authorization code is immediately passed to Laravel, and Laravel performs
+the server-side code exchange with Keycloak.
+
+This means the important OIDC credentials and tokens remain on the server.
+
+The resulting architecture is:
+
+    Browser
+       |
+       v
+    Nuxt 4 SPA
+       |
+       | authorization code / session requests
+       v
+    Laravel 12 BFF
+       |
+       | OpenID Connect
+       v
+    Keycloak
+
+Laravel owns the application session.
+
+Keycloak owns the user's identity and SSO session.
 
 ================================================================================
 ARCHITECTURE
 ================================================================================
 
-```mermaid
-flowchart TD
-    A[Browser] --> B[Nuxt SPA]
-    A --> C[Laravel 12 BFF]
-    C -->|OpenID Connect| D[Keycloak]
-    D --> E[Local User DB]
-```
+The application contains three major components:
+
+    1. Nuxt 4 SPA
+       Responsible for rendering the UI and maintaining client-side
+       authentication state.
+
+    2. Laravel 12 BFF/API
+       Responsible for the OIDC integration, user mapping, server-side
+       session, authorization, API endpoints, and federated logout.
+
+    3. Keycloak
+       Responsible for authentication, passwords, SSO, and the external
+       OpenID Connect identity.
+
+The browser never receives OIDC tokens.
+
+The Laravel API is the only application component that communicates with
+Keycloak using the confidential OIDC client credentials.
 
 ================================================================================
 AUTHENTICATION FLOW
 ================================================================================
 
-The user starts login from the Nuxt SPA.
+The current authentication flow is intentionally split between the browser
+navigation and the Laravel server.
 
-The browser is redirected to Laravel's /sso/redirect endpoint.
+STEP 1 — User starts login
 
-Laravel redirects the browser to Keycloak.
+The user clicks:
 
-Keycloak authenticates the user and redirects back to Laravel.
+    Sign in with Keycloak SSO
 
-Laravel exchanges the authorization code with Keycloak.
+The Nuxt application redirects the browser to:
 
-Laravel maps the OIDC issuer + subject to a local user.
+    GET /sso/redirect
 
-Laravel creates a server-side authenticated session.
+on the Laravel API.
 
-The browser is redirected back to the Nuxt SPA.
+Example:
 
-The SPA calls /api/user using the session cookie.
+    http://localhost:8000/sso/redirect
 
-Laravel resolves and returns the authenticated user.
+
+STEP 2 — Laravel starts OIDC authentication
+
+Laravel redirects the browser to Keycloak's authorization endpoint.
+
+Keycloak displays its login page if the user does not already have an active
+Keycloak SSO session.
+
+If the user already has an active Keycloak SSO session, Keycloak may
+authenticate the user without asking for the password again.
+
+
+STEP 3 — Keycloak redirects back with an authorization code
+
+After successful authentication, Keycloak redirects the browser back to the
+application callback.
+
+The callback contains a temporary authorization code.
+
+Example:
+
+    http://localhost:3000/callback?code=...
+
+
+The authorization code is short-lived and is not an access token.
+
+
+STEP 4 — Nuxt reads the authorization code
+
+The Nuxt callback page reads:
+
+    route.query.code
+
+The callback page validates that the value exists and is a single string.
+
+The Nuxt application then sends the authorization code to Laravel through the
+authentication composable.
+
+Example conceptual flow:
+
+    const success = await exchangeCode(code)
+
+
+STEP 5 — Laravel exchanges the authorization code
+
+Laravel receives the authorization code from Nuxt.
+
+Laravel then communicates directly with Keycloak and exchanges the code for the
+OIDC token response.
+
+The browser does not see the returned tokens.
+
+Laravel validates the OIDC identity and obtains the user's:
+
+    issuer
+    subject
+    name
+    email
+
+The important identity mapping is:
+
+    oidc_issuer + oidc_subject
+
+
+STEP 6 — Laravel creates or updates the local user
+
+Laravel uses the OIDC issuer and subject to locate the local user.
+
+If the user does not exist, Laravel creates the local user.
+
+If the user already exists, Laravel updates the user's profile information.
+
+The local user does not require a password.
+
+Keycloak remains responsible for authentication.
+
+
+STEP 7 — Laravel creates the application session
+
+Laravel logs the user into the application session.
+
+The session is stored server-side.
+
+The browser receives the Laravel session cookie.
+
+The SPA does not receive an OIDC access token, ID token, or refresh token.
+
+
+STEP 8 — Nuxt retrieves the authenticated user
+
+After the authorization code exchange succeeds, Nuxt navigates to:
+
+    /dashboard
+
+The dashboard calls:
+
+    GET /api/user
+
+Laravel resolves the user from the Laravel session and returns the authenticated
+user as JSON.
+
+
+STEP 9 — Subsequent API requests
+
+The Nuxt SPA sends the Laravel session cookie with authenticated API requests.
+
+For example:
+
+    GET  /api/user
+    POST /api/logout
+
+Laravel Sanctum's stateful authentication resolves the session-backed user.
+
+================================================================================
+LOGOUT FLOW
+================================================================================
+
+Logout has two parts.
+
+PART 1 — Laravel application logout
+
+Nuxt calls:
+
+    POST /api/logout
+
+Laravel terminates the Laravel session.
+
+The session cookie becomes invalid.
+
+PART 2 — Keycloak federated logout
+
+Laravel discovers Keycloak's OIDC end-session endpoint and constructs a
+federated logout URL.
+
+The response may contain:
+
+    logout_url
+
+Nuxt follows that URL in the browser.
+
+Keycloak then terminates the user's Keycloak SSO session and redirects the
+browser back to the Nuxt application.
+
+This prevents the following situation:
+
+    Laravel session cleared
+              +
+    Keycloak session still active
+              =
+    User immediately logged in again
+
+Federated logout clears both application and identity-provider sessions.
+
 
 ================================================================================
 SECURITY MODEL
 ================================================================================
 
-Keycloak owns authentication and passwords.
+Keycloak owns:
 
-Laravel owns the application session and authorization.
+    - Passwords
+    - User authentication
+    - SSO sessions
+    - OpenID Connect identity
+    - OIDC authorization
 
-OIDC tokens remain server-side.
+Laravel owns:
 
-The browser never receives the client secret.
+    - Application session
+    - Local user records
+    - Authorization
+    - Business permissions
+    - Application API
+    - Session-based authentication
+    - Federated logout coordination
 
-The SPA does not authenticate users itself.
+Nuxt owns:
 
-Session-based authentication is handled through Laravel Sanctum.
+    - User interface
+    - Authentication state for rendering
+    - Navigation
+    - Sending requests to Laravel
 
-Federated logout terminates both the Laravel and Keycloak sessions.
+Nuxt does NOT own:
+
+    - OIDC client secrets
+    - OIDC access tokens
+    - OIDC ID tokens
+    - OIDC refresh tokens
+    - Passwords
+    - Authorization decisions
+
+
+================================================================================
+TOKEN SECURITY
+================================================================================
+
+The most important security rule in this architecture is:
+
+    OIDC tokens stay server-side.
+
+The Nuxt SPA must never:
+
+    - Store access tokens in localStorage.
+    - Store ID tokens in localStorage.
+    - Store refresh tokens in localStorage.
+    - Put tokens into Pinia state.
+    - Put tokens into useState().
+    - Decode OIDC tokens for authentication.
+    - Send OIDC tokens directly to Keycloak.
+    - Use the OIDC client secret.
+    - Implement its own token refresh logic.
+
+Laravel performs the OIDC code exchange and keeps the resulting credentials
+server-side.
+
+The SPA receives only application-level information such as:
+
+    {
+        "id": 1,
+        "name": "Test User",
+        "email": "test@example.com",
+        "oidc_issuer": "...",
+        "oidc_subject": "..."
+    }
+
 
 ================================================================================
 TECH STACK
 ================================================================================
 
-Backend: Laravel 12, PHP, Laravel Sanctum
-Identity: Keycloak, OpenID Connect, OAuth 2.0
-Database: SQLite for development; PostgreSQL/MySQL supported for production
-Frontend: Nuxt 4
-Architecture: Backend-for-Frontend (BFF), server-side sessions
+Backend:
+
+    Laravel 12
+    PHP 8.2+
+    Laravel Sanctum
+
+Identity:
+
+    Keycloak
+    OpenID Connect
+    OAuth 2.0
+
+Frontend:
+
+    Nuxt 4
+    Vue 3
+    TypeScript
+
+Database:
+
+    SQLite for development
+    PostgreSQL/MySQL supported for production
+
+Architecture:
+
+    Backend-for-Frontend (BFF)
+    Server-side sessions
+    Stateful Laravel authentication
+
 
 ================================================================================
 TABLE OF CONTENTS
 ================================================================================
 
-  1. What This Project Does
-  2. Architecture
-  3. Requirements
-  4. Setup Steps
-  5. Directory Structure
-  6. Configuration Reference
-  7. Key Files (Full Source)
-  8. Routes
-  9. Testing the API
- 10. Common Errors and Fixes
- 11. Production Migration Checklist
- 12. Security Notes
- 13. Related Projects
+    1. What This Project Does
+    2. Architecture
+    3. Authentication Flow
+    4. Requirements
+    5. Setup Steps
+    6. Directory Structure
+    7. Configuration Reference
+    8. Key Files
+    9. Routes
+   10. API Contract
+   11. Testing the API
+   12. Common Errors and Fixes
+   13. Production Migration Checklist
+   14. Security Notes
+   15. Related Projects
+   16. Author
+
 
 ================================================================================
 1. WHAT THIS PROJECT DOES
 ================================================================================
 
-- Implements OIDC login against Keycloak as a confidential client
-- Receives the authorization code at /sso/callback, exchanges it for tokens
-- Maps the OIDC identity (issuer + subject) to a local user record
-- Creates its own Laravel session (cookie) after login
-- Shares that session with the Nuxt SPA running on a different port
-- Exposes /api/user and /api/logout behind auth:sanctum
-- Builds the Keycloak federated logout URL on logout
-- Returns 401 for unauthenticated requests, 403 for unauthorized ones
+This project provides the Laravel backend for the Bakery SSO demonstration.
 
-The Nuxt frontend is a thin client: it renders pages and calls the API. It
-never talks to Keycloak, never handles tokens, never stores secrets.
+It:
+
+- Acts as the OIDC client for Keycloak.
+- Acts as the Backend-for-Frontend for Nuxt.
+- Starts the OIDC authentication flow.
+- Receives authorization-code exchange requests from Nuxt.
+- Exchanges authorization codes with Keycloak.
+- Validates the external OIDC identity.
+- Maps Keycloak identities to local users.
+- Creates Laravel server-side sessions.
+- Provides /api/user.
+- Provides /api/logout.
+- Uses Laravel Sanctum for stateful API authentication.
+- Builds the Keycloak federated logout URL.
+- Returns authenticated user information to Nuxt.
+
+The Nuxt frontend remains intentionally thin.
+
+It does not:
+
+- Communicate directly with Keycloak.
+- Exchange OIDC codes with Keycloak.
+- Store OIDC tokens.
+- Store the OIDC client secret.
+- Validate OIDC tokens itself.
+- Decide whether a user is authenticated.
+- Make authorization decisions.
+
+Laravel remains the trust boundary for application authentication and
+authorization.
+
 
 ================================================================================
 2. ARCHITECTURE
 ================================================================================
 
-```mermaid
-flowchart TD
-    A[Browser] --> B[Nuxt<br/>localhost:3000]
+The development environment uses:
+
+    Nuxt:
+        http://localhost:3000
+
+    Laravel:
+        http://localhost:8000
+
+    Keycloak:
+        http://localhost:9000
+
+The browser communicates with both Nuxt and Laravel.
+
+Nuxt communicates with Laravel.
+
+Laravel communicates with Keycloak.
+
+Nuxt does not communicate directly with Keycloak.
+
+The important request paths are:
+
+    Browser
+       |
+       +----> Nuxt
+       |
+       +----> Laravel
+                |
+                +----> Keycloak
 
 
-B -->|GET /api/user<br/>Session cookie| C[Laravel<br/>localhost:8000]
-B -->|POST /api/logout<br/>Session cookie| C
-B -->|GET /sso/redirect<br/>Browser navigation| C
+AUTHENTICATION REQUEST PATH
 
-C -->|OIDC Authorization Code + PKCE| D[Keycloak<br/>localhost:9000]
+    Browser
+       |
+       v
+    Nuxt
+       |
+       | Navigate to /sso/redirect
+       v
+    Laravel
+       |
+       | OIDC authorization request
+       v
+    Keycloak
+       |
+       | authorization code
+       v
+    Nuxt /callback
+       |
+       | exchangeCode(code)
+       v
+    Laravel
+       |
+       | server-side token exchange
+       v
+    Keycloak
 
-D --> E[SQLite Database]
 
-E --> F[users table]
-E --> G[sessions table]
-```
+APPLICATION SESSION PATH
 
-Two independent sessions exist:
+    Nuxt
+       |
+       | GET /api/user
+       | Laravel session cookie
+       v
+    Laravel
+       |
+       v
+    Authenticated User
 
-  1. Keycloak's SSO session (cookie on localhost:9000)
-     Owned by Keycloak. Determines whether the user is already logged in.
 
-  2. Laravel's session (cookie on localhost, shared with the SPA)
-     Owned by this API. Determines whether the app recognizes the user.
+LOGOUT PATH
 
-The two are independent. Clearing one does not clear the other.
-Federated logout clears both.
+    Nuxt
+       |
+       | POST /api/logout
+       v
+    Laravel
+       |
+       | invalidate Laravel session
+       |
+       | build Keycloak logout URL
+       v
+    Nuxt Browser
+       |
+       v
+    Keycloak
+       |
+       | terminate SSO session
+       v
+    Nuxt
+
 
 ================================================================================
-3. REQUIREMENTS
+3. AUTHENTICATION FLOW
 ================================================================================
 
-- PHP 8.2 or newer (PHP 8.5 tested)
+The current implementation uses a callback page in Nuxt.
+
+The relevant Nuxt route is:
+
+    /callback
+
+The callback receives the temporary OIDC authorization code.
+
+Example:
+
+    /callback?code=abc123...
+
+
+The callback does NOT exchange the code directly with Keycloak.
+
+Instead:
+
+    Nuxt callback
+          |
+          v
+    useAuth().exchangeCode(code)
+          |
+          v
+    Laravel API
+          |
+          v
+    Keycloak
+
+
+The exchange therefore remains server-side.
+
+The complete sequence is:
+
+    1. User clicks Sign In.
+
+    2. Nuxt redirects the browser to:
+           http://localhost:8000/sso/redirect
+
+    3. Laravel redirects the browser to Keycloak.
+
+    4. Keycloak authenticates the user.
+
+    5. Keycloak redirects the browser to:
+           http://localhost:3000/callback?code=...
+
+    6. Nuxt reads the code.
+
+    7. Nuxt calls Laravel's code-exchange endpoint.
+
+    8. Laravel sends the authorization code to Keycloak.
+
+    9. Keycloak returns the OIDC token response to Laravel.
+
+   10. Laravel validates the identity.
+
+   11. Laravel creates or updates the local user.
+
+   12. Laravel creates the Laravel session.
+
+   13. Laravel returns success to Nuxt.
+
+   14. Nuxt navigates to:
+           /dashboard
+
+   15. Dashboard calls:
+           GET /api/user
+
+   16. Laravel resolves the authenticated user from the session.
+
+   17. Nuxt renders the authenticated dashboard.
+
+
+================================================================================
+4. REQUIREMENTS
+================================================================================
+
+Required software:
+
+- PHP 8.2 or newer
 - Composer
-- SQLite (default) or PostgreSQL/MySQL
-- Keycloak running on http://localhost:9000
-  with realm "myapp" and a confidential client "nuxt-laravel-bakery"
-- curl for testing endpoints
+- Node.js 20 or newer
+- npm
+- SQLite for development, or PostgreSQL/MySQL
+- Keycloak
+- A modern browser
+- curl for API testing
 
-Check your PHP version:
+Recommended development versions:
 
-    php -v
+    PHP 8.5
+    Node.js 20+
+    Laravel 12
+    Nuxt 4
+    Keycloak 26.x
+
+
+KEYCLOAK REQUIREMENTS
+
+Keycloak must be running at:
+
+    http://localhost:9000
+
+The realm is:
+
+    myapp
+
+The client is:
+
+    nuxt-laravel-bakery
+
+The client must be configured as a confidential client because the client
+secret belongs to Laravel.
+
+The OIDC redirect/callback configuration must match the current application
+flow.
+
+The browser callback is handled by Nuxt:
+
+    http://localhost:3000/callback
+
+The Laravel OIDC redirect endpoint remains:
+
+    http://localhost:8000/sso/redirect
+
 
 ================================================================================
-4. SETUP STEPS
+5. SETUP STEPS
 ================================================================================
 
-4.1  Create the Laravel project
+5.1 Create the Laravel project
 
     composer create-project laravel/laravel bakery-api
+
     cd bakery-api
 
-4.2  Set up SQLite
+
+5.2 Create the SQLite database
 
     touch database/database.sqlite
 
-    In .env:
+In .env:
 
-      DB_CONNECTION=sqlite
+    DB_CONNECTION=sqlite
 
-4.3  Install required packages
+
+5.3 Install required packages
 
     composer require jeffersongoncalves/laravel-oidc
     composer require laravel/sanctum
 
+Then install the API stack:
+
     php artisan install:api
+
+Publish the OIDC configuration:
+
     php artisan vendor:publish --tag="oidc-config"
 
-4.4  Configure .env
 
-    Full values are in Section 6.
+5.4 Configure .env
 
-4.5  Register Sanctum's stateful middleware
+Use the configuration shown in Section 7.
 
-    Edit bootstrap/app.php. Full contents are in Section 7.
 
-4.6  Update the users migration
+5.5 Register Sanctum's stateful middleware
 
-    Edit database/migrations/0001_01_01_000000_create_users_table.php.
-    Remove the password column. Add oidc_issuer and oidc_subject.
-    Full contents in Section 7.
+Edit:
 
-4.7  Update the User model
+    bootstrap/app.php
 
-    Edit app/Models/User.php. Add HasApiTokens trait and the OIDC fields.
-    Full contents in Section 7.
+The application must call:
 
-4.8  Create the OIDC controller
+    $middleware->statefulApi();
+
+This allows Sanctum to authenticate SPA requests using the Laravel session
+cookie.
+
+
+5.6 Configure CSRF behavior
+
+Because this architecture uses Sanctum's stateful API middleware and the Nuxt
+SPA communicates with Laravel from another origin/port, the API endpoints
+used by the SPA must be configured consistently with the application's CSRF
+strategy.
+
+The current development configuration excludes API routes from Laravel's
+standard CSRF middleware:
+
+    $middleware->validateCsrfTokens(except: [
+        'api/*',
+    ]);
+
+Review this carefully before production deployment.
+
+For production, a stronger CSRF design should be considered if the API is
+exposed to untrusted cross-site origins.
+
+
+5.7 Configure the User model
+
+Edit:
+
+    app/Models/User.php
+
+Add:
+
+    HasApiTokens
+
+and the OIDC fields:
+
+    oidc_issuer
+    oidc_subject
+    name
+    email
+
+
+5.8 Configure the users migration
+
+The local users table does not need a password because Keycloak owns
+authentication.
+
+The important fields are:
+
+    oidc_issuer
+    oidc_subject
+
+Together they uniquely identify the external identity.
+
+
+5.9 Create the OIDC controller
+
+Create:
 
     app/Http/Controllers/Auth/OidcController.php
-    Full contents in Section 7.
 
-4.9  Define routes
+The controller is responsible for:
 
-    routes/web.php and routes/api.php. Full contents in Section 8.
+    - Starting OIDC authentication
+    - Receiving/exchanging the authorization code
+    - Mapping the OIDC identity
+    - Creating the Laravel session
+    - Returning the authenticated user
+    - Logging out
+    - Building the federated logout URL
 
-4.10 Run migrations
+
+5.10 Configure routes
+
+The web routes handle the OIDC browser navigation.
+
+The API routes handle the authenticated application API.
+
+
+5.11 Run migrations
 
     php artisan migrate:fresh
 
-4.11 Start the server
+
+5.12 Clear Laravel configuration
+
+After changing .env:
+
+    php artisan config:clear
+    php artisan route:clear
+    php artisan cache:clear
+
+
+5.13 Start Laravel
 
     php artisan serve
 
-    Laravel listens on http://localhost:8000.
+Laravel:
 
-4.12 Ensure Keycloak and Nuxt are running
+    http://localhost:8000
 
-    In separate terminals:
 
-      cd ~/keycloak/keycloak-26.x.x && bin/kc.sh start-dev --http-port=9000
-      cd ../bakery-spa && npm run dev
+5.14 Start Keycloak
+
+Example:
+
+    cd ~/keycloak/keycloak-26.x.x
+
+    bin/kc.sh start-dev --http-port=9000
+
+
+5.15 Start Nuxt
+
+In the SPA project:
+
+    npm run dev
+
+Nuxt:
+
+    http://localhost:3000
+
 
 ================================================================================
-5. DIRECTORY STRUCTURE
+6. DIRECTORY STRUCTURE
 ================================================================================
 
     bakery-api/
-      .env
-      bootstrap/
-        app.php                    Middleware + routing config
-      app/
-        Http/Controllers/Auth/
-          OidcController.php       OIDC client logic
-        Models/
-          User.php                 User model with OIDC fields
-      database/
-        database.sqlite            The database file
-        migrations/
-          0001_01_01_000000_create_users_table.php
-          0001_01_01_000001_create_cache_table.php
-          0001_01_01_000002_create_jobs_table.php
-      routes/
-        web.php                    OIDC redirect + callback
-        api.php                    /api/user, /api/logout
-      config/
-        oidc.php                   Published by the package
-        auth.php                   Guard configuration
-        cors.php                   Cross-origin config
-        sanctum.php                Stateful domains
-        session.php                Session driver + cookie config
+    |
+    +-- .env
+    |
+    +-- bootstrap/
+    |     +-- app.php
+    |
+    +-- app/
+    |     +-- Http/
+    |     |     +-- Controllers/
+    |     |           +-- Auth/
+    |     |                 +-- OidcController.php
+    |     |
+    |     +-- Models/
+    |           +-- User.php
+    |
+    +-- database/
+    |     +-- database.sqlite
+    |     +-- migrations/
+    |           +-- 0001_01_01_000000_create_users_table.php
+    |           +-- 0001_01_01_000001_create_cache_table.php
+    |           +-- 0001_01_01_000002_create_jobs_table.php
+    |
+    +-- routes/
+    |     +-- web.php
+    |     +-- api.php
+    |
+    +-- config/
+          +-- oidc.php
+          +-- auth.php
+          +-- cors.php
+          +-- sanctum.php
+          +-- session.php
+
 
 ================================================================================
-6. CONFIGURATION REFERENCE
+7. CONFIGURATION REFERENCE
 ================================================================================
 
-6.1  .env — Full configuration
+7.1 .env
+
+Example local configuration:
 
     APP_NAME=Laravel
     APP_ENV=local
-    APP_KEY=base64:...                (generated by composer install)
+    APP_KEY=base64:...
     APP_DEBUG=true
     APP_URL=http://localhost:8000
 
@@ -272,8 +871,8 @@ Check your PHP version:
     SESSION_LIFETIME=120
     SESSION_ENCRYPT=false
     SESSION_PATH=/
-    SESSION_DOMAIN=localhost          ← critical for cross-origin cookies
-    SESSION_SECURE_COOKIE=false       (true in production)
+    SESSION_DOMAIN=localhost
+    SESSION_SECURE_COOKIE=false
 
     CACHE_STORE=database
     QUEUE_CONNECTION=database
@@ -283,640 +882,1367 @@ Check your PHP version:
     OIDC_ISSUER_URL=http://localhost:9000/realms/myapp
     OIDC_CLIENT_ID=nuxt-laravel-bakery
     OIDC_CLIENT_SECRET=<paste-secret-from-keycloak>
-    OIDC_REDIRECT_URI=http://localhost:8000/sso/callback
-    OIDC_ALLOW_INSECURE_URLS=true     (local only — remove in production)
+
+    OIDC_REDIRECT_URI=http://localhost:3000/callback
+
+    OIDC_ALLOW_INSECURE_URLS=true
 
     SANCTUM_STATEFUL_DOMAINS=localhost:3000,localhost:8000
 
-6.2  Why each value matters
 
-    SESSION_DOMAIN=localhost
-      Allows the session cookie to be shared between localhost:3000 (SPA)
-      and localhost:8000 (API). Without this, the SPA cannot send the
-      cookie to the API.
+IMPORTANT:
 
-    SANCTUM_STATEFUL_DOMAINS
-      Tells Sanctum which origins are allowed to make session-based API
-      requests. Must include the SPA origin AND the API's own origin.
+The OIDC redirect URI must match the callback architecture.
 
-    OIDC_ALLOW_INSECURE_URLS=true
-      The OIDC package requires HTTPS for issuer URLs by default. Local
-      Keycloak runs on HTTP, so this flag must be true locally. In
-      production, remove this line entirely.
+If the authorization code is returned to Nuxt:
 
-    SESSION_ENCRYPT=false
-      Keep this false during development. Encryption can mask session
-      issues behind confusing decryption errors.
+    OIDC_REDIRECT_URI=http://localhost:3000/callback
 
-6.3  Ports
-
-    Keycloak    http://localhost:9000
-    Laravel     http://localhost:8000
-    Nuxt        http://localhost:3000
-
-    Use localhost consistently (not 127.0.0.1). Cookie domains must match
-    between the SPA origin and the API origin.
-
-================================================================================
-7. KEY FILES (FULL SOURCE)
-================================================================================
-
---------------------------------------------------------------------------------
-7.1  bootstrap/app.php
---------------------------------------------------------------------------------
-
-<?php
-
-use Illuminate\Foundation\Application;
-use Illuminate\Foundation\Configuration\Exceptions;
-use Illuminate\Foundation\Configuration\Middleware;
-
-return Application::configure(basePath: dirname(__DIR__))
-    ->withRouting(
-        web: __DIR__.'/../routes/web.php',
-        api: __DIR__.'/../routes/api.php',
-        commands: __DIR__.'/../routes/console.php',
-        health: '/up',
-    )
-    ->withMiddleware(function (Middleware $middleware): void {
-        // Enable Sanctum's stateful (session-cookie) authentication for
-        // API routes. Without this, /api/user always returns 401 because
-        // Sanctum only looks for Bearer tokens.
-        $middleware->statefulApi();
-
-        // Exempt API routes from CSRF verification. Sanctum handles their
-        // protection via HttpOnly + SameSite cookies.
-        $middleware->validateCsrfTokens(except: [
-            'api/*',
-        ]);
-    })
-    ->withExceptions(function (Exceptions $exceptions): void {
-        //
-    })->create();
-
---------------------------------------------------------------------------------
-7.2  database/migrations/0001_01_01_000000_create_users_table.php
---------------------------------------------------------------------------------
-
-<?php
-
-use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
-use Illuminate\Support\Facades\Schema;
-
-return new class extends Migration
-{
-    public function up(): void
-    {
-        Schema::create('users', function (Blueprint $table) {
-            $table->id();
-            $table->string('oidc_issuer')->nullable()->index();
-            $table->string('oidc_subject')->nullable()->index();
-            $table->string('name');
-            $table->string('email')->nullable();
-            $table->timestamp('email_verified_at')->nullable();
-            $table->rememberToken();
-            $table->timestamps();
-
-            $table->unique(['oidc_issuer', 'oidc_subject']);
-        });
-
-        Schema::create('password_reset_tokens', function (Blueprint $table) {
-            $table->string('email')->primary();
-            $table->string('token');
-            $table->timestamp('created_at')->nullable();
-        });
-
-        Schema::create('sessions', function (Blueprint $table) {
-            $table->string('id')->primary();
-            $table->foreignId('user_id')->nullable()->index();
-            $table->string('ip_address', 45)->nullable();
-            $table->text('user_agent')->nullable();
-            $table->longText('payload');
-            $table->integer('last_activity')->index();
-        });
-    }
-
-    public function down(): void
-    {
-        Schema::dropIfExists('users');
-        Schema::dropIfExists('password_reset_tokens');
-        Schema::dropIfExists('sessions');
-    }
-};
-
-Note: There is NO password column. In a BFF setup, Laravel never stores
-passwords. Keycloak owns authentication.
-
---------------------------------------------------------------------------------
-7.3  app/Models/User.php
---------------------------------------------------------------------------------
-
-<?php
-
-namespace App\Models;
-
-use Illuminate\Database\Eloquent\Factories\HasFactory;
-use Illuminate\Foundation\Auth\User as Authenticatable;
-use Illuminate\Notifications\Notifiable;
-use Laravel\Sanctum\HasApiTokens;
-
-class User extends Authenticatable
-{
-    use HasApiTokens, HasFactory, Notifiable;
-
-    protected $fillable = [
-        'oidc_issuer',
-        'oidc_subject',
-        'name',
-        'email',
-    ];
-
-    protected $hidden = [
-        'remember_token',
-    ];
-
-    protected function casts(): array
-    {
-        return [
-            'email_verified_at' => 'datetime',
-        ];
-    }
-}
-
---------------------------------------------------------------------------------
-7.4  app/Http/Controllers/Auth/OidcController.php
---------------------------------------------------------------------------------
-
-<?php
-
-namespace App\Http\Controllers\Auth;
-
-use App\Http\Controllers\Controller;
-use App\Models\User;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Log;
-use Laravel\Socialite\Facades\Socialite;
-
-class OidcController extends Controller
-{
-    /**
-     * Kick off the OIDC redirect to Keycloak.
-     */
-    public function redirect()
-    {
-        return Socialite::driver('oidc')
-            ->scopes(['openid', 'profile', 'email'])
-            ->redirect();
-    }
-
-    /**
-     * Handle the callback from Keycloak.
-     */
-    public function callback(Request $request)
-    {
-        try {
-            $oidcUser = Socialite::driver('oidc')->user();
-        } catch (\Throwable $e) {
-            Log::error('OIDC callback failed', [
-                'message' => $e->getMessage(),
-            ]);
-
-            return redirect(
-                config('app.frontend_url') . '/login?error=auth_failed'
-            );
-        }
-
-        // The identity mapping: issuer + subject uniquely identifies the
-        // user in the organization's identity provider.
-        $issuer  = config('oidc.default.issuer_url');
-        $subject = $oidcUser->getId();    // the 'sub' claim
-
-        $user = User::updateOrCreate(
-            [
-                'oidc_issuer'  => $issuer,
-                'oidc_subject' => $subject,
-            ],
-            [
-                'name'  => $oidcUser->getName() ?? 'OIDC User',
-                'email' => $oidcUser->getEmail(),
-            ]
-        );
-
-        // Create the Laravel session
-        Auth::login($user, true);
-        $request->session()->regenerate();
-
-        // Send the browser back to the Nuxt SPA
-        return redirect(config('app.frontend_url') . '/dashboard');
-    }
-
-    /**
-     * Return the currently authenticated user as JSON.
-     */
-    public function user(Request $request)
-    {
-        return response()->json($request->user());
-    }
-
-    /**
-     * Log out of the Laravel session and the Keycloak SSO session.
-     */
-    public function logout(Request $request)
-    {
-        // Use the 'web' guard explicitly. The route uses auth:sanctum,
-        // which resolves to Sanctum's RequestGuard — a class without a
-        // logout() method. The 'web' guard owns the session.
-        Auth::guard('web')->logout();
-
-        $request->session()->invalidate();
-        $request->session()->regenerateToken();
-
-        $logoutUrl = null;
-
-        try {
-            $issuer      = config('oidc.default.issuer_url');
-            $clientId    = config('oidc.default.client_id');
-            $frontendUrl = config('app.frontend_url');
-
-            if ($issuer && $clientId) {
-                // Discover the IdP's end_session_endpoint
-                $response = \Illuminate\Support\Facades\Http::timeout(5)
-                    ->get($issuer . '/.well-known/openid-configuration');
-
-                if ($response->successful()) {
-                    $discovery = $response->json();
-                    $endSessionEndpoint = $discovery['end_session_endpoint'] ?? null;
-
-                    if ($endSessionEndpoint) {
-                        $params = http_build_query([
-                            'post_logout_redirect_uri' => $frontendUrl,
-                            'client_id' => $clientId,
-                        ]);
-
-                        $logoutUrl = $endSessionEndpoint . '?' . $params;
-                    }
-                }
-            }
-        } catch (\Throwable $e) {
-            // Do not fail the request if the URL cannot be built.
-            // The local session is already cleared at this point.
-            Log::error('Logout URL construction failed', [
-                'message' => $e->getMessage(),
-            ]);
-        }
-
-        return response()->json([
-            'message'    => 'Logged out',
-            'logout_url' => $logoutUrl,
-        ]);
-    }
-}
-
---------------------------------------------------------------------------------
-7.5  routes/web.php
---------------------------------------------------------------------------------
-
-<?php
-
-use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\Auth\OidcController;
-
-Route::get('/', function () {
-    return view('welcome');
-});
-
-Route::get('/sso/redirect', [OidcController::class, 'redirect'])
-    ->name('oidc.redirect');
-
-Route::get('/sso/callback', [OidcController::class, 'callback'])
-    ->name('oidc.callback');
-
---------------------------------------------------------------------------------
-7.6  routes/api.php
---------------------------------------------------------------------------------
-
-<?php
-
-use App\Http\Controllers\Auth\OidcController;
-use Illuminate\Support\Facades\Route;
-
-Route::middleware('auth:sanctum')->group(function () {
-    Route::get('/user', [OidcController::class, 'user']);
-    Route::post('/logout', [OidcController::class, 'logout']);
-});
-
-================================================================================
-8. ROUTES
-================================================================================
-
-  Method   Path              Middleware       Purpose
-  ----------------------------------------------------------------------------
-  GET      /sso/redirect     web              Starts the OIDC flow
-  GET      /sso/callback     web              Handles Keycloak's redirect
-  GET      /api/user         auth:sanctum     Returns the current user
-  POST     /api/logout       auth:sanctum     Ends session + builds logout URL
-
-Verify the routes exist:
-
-    php artisan route:list | grep -E 'sso|api/user|api/logout'
-
-Expected output:
-
-    GET|HEAD  sso/callback    oidc.callback
-    GET|HEAD  sso/redirect    oidc.redirect
-    GET|HEAD  api/user        Auth\OidcController@user
-    POST      api/logout      Auth\OidcController@logout
-
-================================================================================
-9. TESTING THE API
-================================================================================
-
-9.1  Verify Laravel is running
-
-    curl -sI http://localhost:8000/sso/redirect | head -5
-
-    Should return:
-
-      HTTP/1.1 302 Found
-      Location: http://localhost:9000/realms/myapp/protocol/openid-connect/auth?...
-
-    If you see the Location header pointing to Keycloak, the OIDC client
-    is configured correctly.
-
-9.2  Verify unauthenticated requests return 401
-
-    curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/api/user
-
-    Expected: 401
-
-9.3  Verify the database schema
-
-    php artisan tinker
-
-    > Schema::getColumnListing('users')
-    > DB::table('sessions')->count()
-    > DB::table('users')->count()
-
-    The users table should NOT have a password column.
-
-9.4  Verify the discovery document is reachable
-
-    curl -s http://localhost:9000/realms/myapp/.well-known/openid-configuration \
-      | python3 -m json.tool | grep end_session
-
-    Expected:
-
-      "end_session_endpoint": "http://localhost:9000/realms/myapp/protocol/openid-connect/logout"
-
-================================================================================
-10. COMMON ERRORS AND FIXES
-================================================================================
-
-10.1  SQLSTATE[23000]: NOT NULL constraint failed: users.password
-
-Cause:
-  The default Laravel users table has a password column, but SSO users
-  have no password.
-
-Fix:
-  Remove the password column from the users migration. See Section 7.2.
-  Run php artisan migrate:fresh.
-
-10.2  Invalid parameter: redirect_uri
-
-Cause:
-  The redirect URI sent by Laravel does not exactly match what is
-  registered in Keycloak. "127.0.0.1" and "localhost" are treated as
-  different strings.
-
-Fix:
-  Standardize on "localhost". In .env:
+If the OIDC package itself expects Laravel to receive the authorization
+callback, then the redirect URI would instead be:
 
     OIDC_REDIRECT_URI=http://localhost:8000/sso/callback
 
-  And register the same value in Keycloak's "Valid redirect URIs".
+Do not configure both flows simultaneously.
 
-10.3  Invalid redirect uri (on logout)
+The current Nuxt callback/exchange architecture uses:
+
+    http://localhost:3000/callback
+
+
+7.2 Why SESSION_DOMAIN matters
+
+The Nuxt application runs at:
+
+    localhost:3000
+
+The Laravel API runs at:
+
+    localhost:8000
+
+They have different ports but the same host.
+
+The Laravel session cookie must therefore be configured so the browser can send
+it to the Laravel API.
+
+Use:
+
+    SESSION_DOMAIN=localhost
+
+Do not mix:
+
+    localhost
+
+with:
+
+    127.0.0.1
+
+during development.
+
+Treat them as different hosts.
+
+
+7.3 Sanctum stateful domains
+
+Use:
+
+    SANCTUM_STATEFUL_DOMAINS=localhost:3000,localhost:8000
+
+The Nuxt application must be included because it is the SPA making stateful
+requests.
+
+The Laravel origin may also be included for consistency with the local
+development setup.
+
+
+7.4 OIDC_ALLOW_INSECURE_URLS
+
+Local Keycloak is running over HTTP.
+
+Therefore:
+
+    OIDC_ALLOW_INSECURE_URLS=true
+
+may be required during local development.
+
+Do not use this setting in production.
+
+Production must use HTTPS.
+
+
+7.5 SESSION_SECURE_COOKIE
+
+Development:
+
+    SESSION_SECURE_COOKIE=false
+
+Production:
+
+    SESSION_SECURE_COOKIE=true
+
+Production authentication should always run over HTTPS.
+
+
+7.6 Ports
+
+    Keycloak:
+        http://localhost:9000
+
+    Laravel:
+        http://localhost:8000
+
+    Nuxt:
+        http://localhost:3000
+
+
+================================================================================
+8. KEY FILES
+================================================================================
+
+--------------------------------------------------------------------------------
+8.1 bootstrap/app.php
+--------------------------------------------------------------------------------
+
+    <?php
+
+    use Illuminate\Foundation\Application;
+    use Illuminate\Foundation\Configuration\Exceptions;
+    use Illuminate\Foundation\Configuration\Middleware;
+
+    return Application::configure(basePath: dirname(__DIR__))
+        ->withRouting(
+            web: __DIR__.'/../routes/web.php',
+            api: __DIR__.'/../routes/api.php',
+            commands: __DIR__.'/../routes/console.php',
+            health: '/up',
+        )
+        ->withMiddleware(function (Middleware $middleware): void {
+            $middleware->statefulApi();
+
+            $middleware->validateCsrfTokens(except: [
+                'api/*',
+            ]);
+        })
+        ->withExceptions(function (Exceptions $exceptions): void {
+            //
+        })->create();
+
+
+--------------------------------------------------------------------------------
+8.2 users migration
+--------------------------------------------------------------------------------
+
+    <?php
+
+    use Illuminate\Database\Migrations\Migration;
+    use Illuminate\Database\Schema\Blueprint;
+    use Illuminate\Support\Facades\Schema;
+
+    return new class extends Migration
+    {
+        public function up(): void
+        {
+            Schema::create('users', function (Blueprint $table) {
+                $table->id();
+
+                $table->string('oidc_issuer')->nullable()->index();
+                $table->string('oidc_subject')->nullable()->index();
+
+                $table->string('name');
+                $table->string('email')->nullable();
+                $table->timestamp('email_verified_at')->nullable();
+
+                $table->rememberToken();
+                $table->timestamps();
+
+                $table->unique([
+                    'oidc_issuer',
+                    'oidc_subject',
+                ]);
+            });
+
+            Schema::create('password_reset_tokens', function (Blueprint $table) {
+                $table->string('email')->primary();
+                $table->string('token');
+                $table->timestamp('created_at')->nullable();
+            });
+
+            Schema::create('sessions', function (Blueprint $table) {
+                $table->string('id')->primary();
+                $table->foreignId('user_id')->nullable()->index();
+                $table->string('ip_address', 45)->nullable();
+                $table->text('user_agent')->nullable();
+                $table->longText('payload');
+                $table->integer('last_activity')->index();
+            });
+        }
+
+        public function down(): void
+        {
+            Schema::dropIfExists('sessions');
+            Schema::dropIfExists('password_reset_tokens');
+            Schema::dropIfExists('users');
+        }
+    };
+
+
+There is deliberately no password column.
+
+Keycloak owns password authentication.
+
+
+--------------------------------------------------------------------------------
+8.3 app/Models/User.php
+--------------------------------------------------------------------------------
+
+    <?php
+
+    namespace App\Models;
+
+    use Illuminate\Database\Eloquent\Factories\HasFactory;
+    use Illuminate\Foundation\Auth\User as Authenticatable;
+    use Illuminate\Notifications\Notifiable;
+    use Laravel\Sanctum\HasApiTokens;
+
+    class User extends Authenticatable
+    {
+        use HasApiTokens, HasFactory, Notifiable;
+
+        protected $fillable = [
+            'oidc_issuer',
+            'oidc_subject',
+            'name',
+            'email',
+        ];
+
+        protected $hidden = [
+            'remember_token',
+        ];
+
+        protected function casts(): array
+        {
+            return [
+                'email_verified_at' => 'datetime',
+            ];
+        }
+    }
+
+
+--------------------------------------------------------------------------------
+8.4 app/Http/Controllers/Auth/OidcController.php
+--------------------------------------------------------------------------------
+
+The controller should provide four logical operations:
+
+    redirect()
+        Starts the Keycloak authentication flow.
+
+    exchangeCode()
+        Receives the authorization code from Nuxt, exchanges it with Keycloak,
+        maps the identity, and creates the Laravel session.
+
+    user()
+        Returns the currently authenticated application user.
+
+    logout()
+        Clears the Laravel session and prepares the Keycloak federated logout.
+
+
+A representative controller structure is:
+
+    <?php
+
+    namespace App\Http\Controllers\Auth;
+
+    use App\Http\Controllers\Controller;
+    use App\Models\User;
+    use Illuminate\Http\Request;
+    use Illuminate\Support\Facades\Auth;
+    use Illuminate\Support\Facades\Http;
+    use Illuminate\Support\Facades\Log;
+
+    class OidcController extends Controller
+    {
+        public function redirect()
+        {
+            /*
+             * Start the OIDC authorization flow.
+             *
+             * The exact implementation depends on the installed OIDC package.
+             * The important architectural rule is that Laravel controls the
+             * OIDC client configuration and client secret.
+             */
+        }
+
+        public function exchangeCode(Request $request)
+        {
+            $validated = $request->validate([
+                'code' => ['required', 'string'],
+            ]);
+
+            /*
+             * Exchange $validated['code'] with Keycloak.
+             *
+             * The access token, ID token, and refresh token returned by
+             * Keycloak remain server-side.
+             *
+             * Do not return the token response to Nuxt.
+             */
+
+            /*
+             * After successful OIDC validation:
+             *
+             * $issuer  = ...
+             * $subject = ...
+             * $name    = ...
+             * $email   = ...
+             *
+             * $user = User::updateOrCreate(
+             *     [
+             *         'oidc_issuer' => $issuer,
+             *         'oidc_subject' => $subject,
+             *     ],
+             *     [
+             *         'name' => $name,
+             *         'email' => $email,
+             *     ]
+             * );
+             *
+             * Auth::login($user, true);
+             * $request->session()->regenerate();
+             */
+
+            return response()->json([
+                'message' => 'Authentication successful.',
+            ]);
+        }
+
+        public function user(Request $request)
+        {
+            return response()->json($request->user());
+        }
+
+        public function logout(Request $request)
+        {
+            Auth::guard('web')->logout();
+
+            $request->session()->invalidate();
+            $request->session()->regenerateToken();
+
+            $logoutUrl = null;
+
+            try {
+                /*
+                 * Discover Keycloak's end_session_endpoint and construct
+                 * the federated logout URL.
+                 */
+            } catch (\Throwable $e) {
+                Log::error('Logout URL construction failed', [
+                    'message' => $e->getMessage(),
+                ]);
+            }
+
+            return response()->json([
+                'message' => 'Logged out',
+                'logout_url' => $logoutUrl,
+            ]);
+        }
+    }
+
+
+IMPORTANT:
+
+The exact OIDC package API should be treated as authoritative for the actual
+implementation of the code-exchange operation.
+
+The controller must never return the Keycloak token response to Nuxt.
+
+
+--------------------------------------------------------------------------------
+8.5 routes/web.php
+--------------------------------------------------------------------------------
+
+The browser-facing OIDC start route is:
+
+    <?php
+
+    use App\Http\Controllers\Auth\OidcController;
+    use Illuminate\Support\Facades\Route;
+
+    Route::get('/', function () {
+        return view('welcome');
+    });
+
+    Route::get('/sso/redirect', [OidcController::class, 'redirect'])
+        ->name('oidc.redirect');
+
+
+The important change from the previous architecture is that the final OIDC
+callback is handled by the Nuxt callback page.
+
+Therefore, do not keep a second unused Laravel callback flow unless the OIDC
+package specifically requires Laravel to receive the callback.
+
+
+--------------------------------------------------------------------------------
+8.6 routes/api.php
+--------------------------------------------------------------------------------
+
+The API routes are:
+
+    <?php
+
+    use App\Http\Controllers\Auth\OidcController;
+    use Illuminate\Support\Facades\Route;
+
+    Route::post('/auth/exchange', [OidcController::class, 'exchangeCode']);
+
+    Route::middleware('auth:sanctum')->group(function () {
+        Route::get('/user', [OidcController::class, 'user']);
+        Route::post('/logout', [OidcController::class, 'logout']);
+    });
+
+
+The important endpoints are:
+
+    POST /api/auth/exchange
+    GET  /api/user
+    POST /api/logout
+
+
+================================================================================
+9. ROUTES
+================================================================================
+
+The current architecture uses these routes:
+
+    Method       Path                  Authentication      Purpose
+    --------------------------------------------------------------------------
+    GET          /sso/redirect         None                Start OIDC login
+    POST         /api/auth/exchange   None                Exchange auth code
+    GET          /api/user             auth:sanctum        Current user
+    POST         /api/logout           auth:sanctum        Logout
+
+
+The browser login flow is:
+
+    GET /sso/redirect
+
+The Nuxt callback then sends:
+
+    POST /api/auth/exchange
+
+with:
+
+    {
+        "code": "..."
+    }
+
+
+The exchange endpoint creates the Laravel session.
+
+After that:
+
+    GET /api/user
+
+returns the authenticated user.
+
+
+VERIFY ROUTES
+
+Run:
+
+    php artisan route:list | grep -E 'sso|auth/exchange|api/user|api/logout'
+
+
+Expected conceptual output:
+
+    GET|HEAD  sso/redirect
+    POST      api/auth/exchange
+    GET       api/user
+    POST      api/logout
+
+
+================================================================================
+10. API CONTRACT
+================================================================================
+
+10.1 POST /api/auth/exchange
+
+Purpose:
+
+    Exchange the temporary OIDC authorization code for a Laravel session.
+
+Request:
+
+    {
+        "code": "temporary-authorization-code"
+    }
+
+
+Successful response:
+
+    {
+        "message": "Authentication successful."
+    }
+
+
+Important:
+
+The response must NOT contain:
+
+    access_token
+    id_token
+    refresh_token
+    client_secret
+
+
+The Laravel session cookie is the authentication mechanism used by the SPA
+after the exchange.
+
+
+--------------------------------------------------------------------------------
+10.2 GET /api/user
+--------------------------------------------------------------------------------
+
+Purpose:
+
+    Return the currently authenticated Laravel user.
+
+Authentication:
+
+    Laravel session cookie through Sanctum.
+
+
+Example response:
+
+    {
+        "id": 1,
+        "name": "Test User",
+        "email": "test@example.com",
+        "oidc_issuer": "http://localhost:9000/realms/myapp",
+        "oidc_subject": "123456789"
+    }
+
+
+Unauthenticated response:
+
+    HTTP 401
+
+
+--------------------------------------------------------------------------------
+10.3 POST /api/logout
+--------------------------------------------------------------------------------
+
+Purpose:
+
+    End the Laravel session and prepare federated Keycloak logout.
+
+
+Successful response:
+
+    {
+        "message": "Logged out",
+        "logout_url": "http://localhost:9000/..."
+    }
+
+
+The logout_url may be null if Keycloak's discovery endpoint cannot be reached
+or if an end-session endpoint is not available.
+
+Nuxt should still clear its local authentication state.
+
+
+================================================================================
+11. TESTING THE API
+================================================================================
+
+11.1 Verify Laravel is running
+
+    curl -sI http://localhost:8000/sso/redirect | head -5
+
+
+Expected:
+
+    HTTP/1.1 302 Found
+
+The Location header should point toward Keycloak.
+
+
+--------------------------------------------------------------------------------
+11.2 Verify unauthenticated API access
+--------------------------------------------------------------------------------
+
+Run:
+
+    curl -s -o /dev/null -w "%{http_code}\n" \
+      http://localhost:8000/api/user
+
+
+Expected:
+
+    401
+
+
+--------------------------------------------------------------------------------
+11.3 Verify routes
+--------------------------------------------------------------------------------
+
+Run:
+
+    php artisan route:list
+
+
+Confirm:
+
+    /sso/redirect
+    /api/auth/exchange
+    /api/user
+    /api/logout
+
+
+--------------------------------------------------------------------------------
+11.4 Verify database schema
+--------------------------------------------------------------------------------
+
+Run:
+
+    php artisan tinker
+
+
+Then:
+
+    Schema::getColumnListing('users')
+
+The result should contain:
+
+    id
+    oidc_issuer
+    oidc_subject
+    name
+    email
+    email_verified_at
+    remember_token
+    created_at
+    updated_at
+
+There should NOT be:
+
+    password
+
+
+--------------------------------------------------------------------------------
+11.5 Verify sessions
+--------------------------------------------------------------------------------
+
+Run:
+
+    php artisan tinker
+
+Then:
+
+    DB::table('sessions')->count()
+
+
+After a successful login, the number of sessions should reflect the active
+Laravel session.
+
+
+--------------------------------------------------------------------------------
+11.6 Verify Keycloak discovery
+--------------------------------------------------------------------------------
+
+Run:
+
+    curl -s \
+      http://localhost:9000/realms/myapp/.well-known/openid-configuration \
+      | python3 -m json.tool
+
+
+Confirm the discovery document contains the required OIDC endpoints.
+
+
+================================================================================
+12. COMMON ERRORS AND FIXES
+================================================================================
+
+12.1 TypeScript says the callback code may be undefined
+
+Symptom:
+
+    Argument of type
+    'LocationQueryValue$1 | LocationQueryValue$1[] | undefined'
+    is not assignable to parameter of type 'string'.
 
 Cause:
-  The post_logout_redirect_uri sent by Laravel does not exactly match
-  what is registered in Keycloak. "http://localhost:3000" and
-  "http://localhost:3000/" are treated as different strings.
+
+    route.query.code is not guaranteed to be a string.
 
 Fix:
-  In Keycloak → Clients → nuxt-laravel-bakery → Settings →
-  Valid post logout redirect URIs, ensure the entry matches FRONTEND_URL
-  in Laravel's .env exactly.
 
-10.4  419 unknown status on POST /api/logout
+    Check the value before calling exchangeCode().
 
-Cause:
-  Sanctum's statefulApi() adds the web middleware group (including CSRF
-  verification) to API routes. Cross-origin POSTs from the SPA do not
-  carry the CSRF header.
+The callback should use logic equivalent to:
 
-Fix:
-  Exempt API routes from CSRF in bootstrap/app.php:
+    const code = route.query.code
 
-    $middleware->validateCsrfTokens(except: ['api/*']);
+    if (typeof code !== 'string' || !code) {
+        await navigateTo('/login?error=missing_auth_code', {
+            replace: true,
+        })
+        return
+    }
 
-10.5  Method Illuminate\Auth\RequestGuard::logout does not exist
+    const success = await exchangeCode(code)
 
-Cause:
-  The /api/logout route uses auth:sanctum. When the request is
-  authenticated, the resolved guard is Sanctum's RequestGuard — which
-  has no logout() method.
+    if (!success) {
+        await navigateTo('/login?error=auth_exchange_failed', {
+            replace: true,
+        })
+        return
+    }
 
-Fix:
-  Call the session guard explicitly:
+    await navigateTo('/dashboard', {
+        replace: true,
+    })
 
-    Auth::guard('web')->logout();
 
-  Note: 'web' is the guard name from config/auth.php, not the
-  routes/web.php file.
+The important part is the explicit:
 
-10.6  /api/user returns 401 despite a valid session cookie
+    return
 
-Cause:
-  Sanctum's stateful middleware is not registered on the API group.
-  The route has no session handling, so Sanctum looks for a Bearer
-  token and finds none.
+after the failed validation/navigation.
 
-Fix:
-  In bootstrap/app.php, inside withMiddleware:
+Without it, TypeScript may still consider code potentially undefined because
+navigateTo() does not automatically terminate the current function's control
+flow.
+
+
+--------------------------------------------------------------------------------
+12.2 /api/user returns 401 after successful login
+--------------------------------------------------------------------------------
+
+Possible causes:
+
+    - Laravel session cookie was not created.
+    - SESSION_DOMAIN is incorrect.
+    - Sanctum statefulApi() is missing.
+    - The browser did not send credentials.
+    - Nuxt SSR did not forward cookies.
+    - Laravel session configuration is incorrect.
+
+
+Check bootstrap/app.php:
 
     $middleware->statefulApi();
 
-  Then clear config and restart:
+
+Check .env:
+
+    SESSION_DOMAIN=localhost
+
+    SANCTUM_STATEFUL_DOMAINS=localhost:3000,localhost:8000
+
+
+Check Nuxt requests:
+
+    credentials: 'include'
+
+
+For SSR requests, use:
+
+    useRequestFetch()
+
+
+--------------------------------------------------------------------------------
+12.3 Session cookie is missing
+--------------------------------------------------------------------------------
+
+Cause:
+
+    The browser is using localhost while Laravel is configured for
+    127.0.0.1, or vice versa.
+
+Fix:
+
+    Use localhost consistently:
+
+        http://localhost:3000
+        http://localhost:8000
+        http://localhost:9000
+
+
+Then:
+
+    php artisan config:clear
+
+
+--------------------------------------------------------------------------------
+12.4 Authorization code exchange fails
+--------------------------------------------------------------------------------
+
+Possible causes:
+
+    - The code has already been used.
+    - The code expired.
+    - The redirect URI does not match.
+    - Client ID is incorrect.
+    - Client secret is incorrect.
+    - Keycloak cannot be reached.
+    - PKCE parameters do not match if PKCE is enabled.
+    - The OIDC issuer is incorrect.
+    - The browser callback is using a different redirect URI from the one
+      registered in Keycloak.
+
+
+Check:
+
+    OIDC_ISSUER_URL
+    OIDC_CLIENT_ID
+    OIDC_CLIENT_SECRET
+    OIDC_REDIRECT_URI
+
+
+Make sure the redirect URI matches the actual flow.
+
+
+--------------------------------------------------------------------------------
+12.5 Invalid redirect_uri
+--------------------------------------------------------------------------------
+
+Cause:
+
+    The redirect URI sent during the authorization flow does not exactly
+    match the URI registered in Keycloak.
+
+Do not mix:
+
+    localhost
+
+and:
+
+    127.0.0.1
+
+
+For the current browser callback architecture, verify the Keycloak redirect
+configuration corresponds to:
+
+    http://localhost:3000/callback
+
+
+The exact value depends on the OIDC package's authorization-code flow.
+
+
+--------------------------------------------------------------------------------
+12.6 Invalid post_logout_redirect_uri
+--------------------------------------------------------------------------------
+
+Cause:
+
+    Keycloak does not recognize the URI Laravel sends during federated
+    logout.
+
+For local development, register:
+
+    http://localhost:3000
+
+in the Keycloak client's valid post logout redirect URIs.
+
+Make sure the value exactly matches the Laravel:
+
+    FRONTEND_URL=http://localhost:3000
+
+
+--------------------------------------------------------------------------------
+12.7 419 on POST /api/logout
+--------------------------------------------------------------------------------
+
+Cause:
+
+    Laravel's CSRF middleware is rejecting the cross-origin API request.
+
+
+Current development configuration:
+
+    $middleware->validateCsrfTokens(except: [
+        'api/*',
+    ]);
+
+
+For production, revisit this decision and implement an explicit CSRF strategy
+appropriate for the deployment architecture.
+
+
+--------------------------------------------------------------------------------
+12.8 Method Illuminate\Auth\RequestGuard::logout does not exist
+--------------------------------------------------------------------------------
+
+Cause:
+
+    The request is authenticated through auth:sanctum, whose guard is not
+    the session guard used for Laravel logout.
+
+
+Fix:
+
+    Auth::guard('web')->logout();
+
+
+Then:
+
+    $request->session()->invalidate();
+    $request->session()->regenerateToken();
+
+
+--------------------------------------------------------------------------------
+12.9 Login works but user is immediately unauthenticated
+--------------------------------------------------------------------------------
+
+Cause:
+
+    Laravel successfully created a session but the browser did not retain
+    or return the Laravel session cookie.
+
+
+Check:
+
+    SESSION_DOMAIN=localhost
+    SESSION_SECURE_COOKIE=false
+    SESSION_PATH=/
+    SANCTUM_STATEFUL_DOMAINS=localhost:3000,localhost:8000
+
+
+Also verify the browser's Application/Storage tab.
+
+
+--------------------------------------------------------------------------------
+12.10 Logout succeeds but the next login is automatic
+--------------------------------------------------------------------------------
+
+Cause:
+
+    Laravel's session was destroyed, but the Keycloak SSO session remained.
+
+
+Fix:
+
+    Follow the logout_url returned by Laravel.
+
+
+The browser must reach Keycloak's end-session endpoint.
+
+
+--------------------------------------------------------------------------------
+12.11 Keycloak still logs the user in after logout
+--------------------------------------------------------------------------------
+
+Check:
+
+    - Laravel actually returned logout_url.
+    - Nuxt actually navigated to logout_url.
+    - Keycloak has a valid post logout redirect URI.
+    - The correct client_id was supplied.
+    - The Keycloak SSO cookie was actually cleared.
+
+
+--------------------------------------------------------------------------------
+12.12 Configuration changes are not taking effect
+--------------------------------------------------------------------------------
+
+Run:
 
     php artisan config:clear
     php artisan route:clear
+    php artisan cache:clear
 
-10.7  Session cookie missing from the browser
 
-Cause:
-  SESSION_DOMAIN in .env is null or set to 127.0.0.1 while the browser
-  is on localhost.
+Then restart:
 
-Fix:
-  In .env:
+    php artisan serve
 
-    SESSION_DOMAIN=localhost
-    APP_URL=http://localhost:8000
-    FRONTEND_URL=http://localhost:3000
-
-  Then:
-
-    php artisan config:clear
-
-10.8  Database is locked
-
-Cause:
-  H2 or SQLite write contention during concurrent requests, or a
-  previous php artisan serve process still holding the file.
-
-Fix:
-  Stop all running php artisan serve processes. Restart one.
-
-    # On macOS
-    lsof -iTCP:8000 -sTCP:LISTEN
-    kill -9 <PID>
 
 ================================================================================
-11. PRODUCTION MIGRATION CHECKLIST
+13. PRODUCTION MIGRATION CHECKLIST
 ================================================================================
 
-When moving this API from local development to production, only the
-following values change. No source code changes are required.
+The production architecture should retain the same fundamental security model.
 
-11.1  .env diff
+Production values should look conceptually like:
 
-  Variable                      Local                              Production
-  ------------------------------------------------------------------------------
-  APP_ENV                       local                              production
-  APP_DEBUG                     true                               false
-  APP_URL                       http://localhost:8000              https://api.company.com
-  FRONTEND_URL                  http://localhost:3000              https://app.company.com
-  OIDC_ISSUER_URL               http://localhost:9000/realms/myapp https://login.company.com/realms/myapp
-  OIDC_CLIENT_ID                nuxt-laravel-bakery                <production-client-id>
-  OIDC_CLIENT_SECRET            <local-secret>                     <production-secret>
-  OIDC_REDIRECT_URI             http://localhost:8000/sso/callback https://api.company.com/sso/callback
-  OIDC_ALLOW_INSECURE_URLS      true                               <remove entirely>
-  SESSION_DOMAIN                localhost                          .company.com
-  SESSION_SECURE_COOKIE         false                              true
-  SANCTUM_STATEFUL_DOMAINS      localhost:3000,localhost:8000      app.company.com,api.company.com
+    APP_ENV=production
+    APP_DEBUG=false
 
-11.2  Additional production changes
+    APP_URL=https://api.company.com
 
-  - Force HTTPS. In AppServiceProvider:
+    FRONTEND_URL=https://app.company.com
 
-      public function boot(): void
-      {
-          if ($this->app->environment('production')) {
-              \URL::forceScheme('https');
-          }
-      }
+    OIDC_ISSUER_URL=https://login.company.com/realms/myapp
 
-  - Trust your reverse proxy. In bootstrap/app.php:
+    OIDC_CLIENT_ID=<production-client-id>
 
-      $middleware->trustProxies(at: '*');
+    OIDC_CLIENT_SECRET=<production-secret>
 
-    Or specify CIDR ranges if the proxy IPs are known.
+    OIDC_REDIRECT_URI=https://app.company.com/callback
 
-  - Replace SQLite with PostgreSQL or MySQL. Update DB_CONNECTION,
-    DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD.
+    OIDC_ALLOW_INSECURE_URLS=<remove>
 
-  - Consider JWKS-based token validation. The current configuration uses
-    the OIDC package's discovery and JWKS caching automatically — verify
-    it is enabled in production.
+    SESSION_SECURE_COOKIE=true
 
-  - Set session timeouts deliberately. In config/session.php:
+    SANCTUM_STATEFUL_DOMAINS=app.company.com,api.company.com
 
-      'lifetime' => 120,   // minutes
 
-    Coordinate with the identity team on the Keycloak-side session
-    timeout (Realm settings → Sessions).
+IMPORTANT:
 
-  - Back up both databases. Laravel's and Keycloak's.
+Do not copy development secrets into production.
 
-11.3  What does NOT change
+Generate a separate production Keycloak client secret.
 
-  - app/Http/Controllers/Auth/OidcController.php
-  - app/Models/User.php
-  - routes/web.php and routes/api.php
-  - The user mapping logic (oidc_issuer + oidc_subject)
-  - The 401 / 403 distinction
-  - The middleware registration
 
-The architecture is production-shaped. Only the values change.
+--------------------------------------------------------------------------------
+13.1 HTTPS
+--------------------------------------------------------------------------------
+
+Production must use HTTPS.
+
+The following should all use HTTPS:
+
+    Nuxt
+    Laravel
+    Keycloak
+
+
+--------------------------------------------------------------------------------
+13.2 Secure cookies
+--------------------------------------------------------------------------------
+
+Use:
+
+    SESSION_SECURE_COOKIE=true
+
+
+The Laravel session cookie should remain HttpOnly.
+
+
+--------------------------------------------------------------------------------
+13.3 Session domain
+--------------------------------------------------------------------------------
+
+Depending on the final deployment topology, configure the session cookie
+domain deliberately.
+
+For example:
+
+    SESSION_DOMAIN=.company.com
+
+
+Only use a parent-domain cookie when the deployment actually requires it.
+
+
+--------------------------------------------------------------------------------
+13.4 CORS
+--------------------------------------------------------------------------------
+
+Never use:
+
+    Access-Control-Allow-Origin: *
+
+together with credentials.
+
+Explicitly allow the production SPA origin.
+
+
+Example:
+
+    https://app.company.com
+
+
+--------------------------------------------------------------------------------
+13.5 Trusted proxies
+--------------------------------------------------------------------------------
+
+If Laravel is behind Nginx, a load balancer, Cloudflare, Kubernetes ingress,
+or another reverse proxy, configure trusted proxies correctly.
+
+Do not blindly trust every proxy in security-sensitive deployments.
+
+Specify the actual proxy IP ranges when possible.
+
+
+--------------------------------------------------------------------------------
+13.6 Database
+--------------------------------------------------------------------------------
+
+SQLite is appropriate for this demonstration.
+
+Production should normally use:
+
+    PostgreSQL
+
+or:
+
+    MySQL
+
+
+Use a managed/production-grade database where appropriate.
+
+
+--------------------------------------------------------------------------------
+13.7 Keycloak configuration
+--------------------------------------------------------------------------------
+
+Create a dedicated production Keycloak client.
+
+Do not reuse the local development client secret.
+
+Register the exact production callback URI.
+
+Register the exact production post-logout URI.
+
+
+--------------------------------------------------------------------------------
+13.8 Logging
+--------------------------------------------------------------------------------
+
+Never log:
+
+    access_token
+    id_token
+    refresh_token
+    client_secret
+    session secrets
+
+Log identifiers and error context instead.
+
+
+--------------------------------------------------------------------------------
+13.9 Session lifetime
+--------------------------------------------------------------------------------
+
+Coordinate:
+
+    Laravel session lifetime
+
+with:
+
+    Keycloak SSO session timeout
+    Keycloak idle timeout
+    Keycloak maximum session lifespan
+
+
+These values should be intentionally designed rather than left accidental.
+
+
+--------------------------------------------------------------------------------
+13.10 What should remain unchanged
+--------------------------------------------------------------------------------
+
+The following architectural rules should remain unchanged:
+
+    - Nuxt does not hold OIDC tokens.
+    - Laravel remains the OIDC client.
+    - Keycloak remains the identity provider.
+    - Laravel owns the application session.
+    - OIDC issuer + subject identify the local user.
+    - API authentication uses the Laravel session.
+    - 401 means unauthenticated.
+    - 403 means authenticated but unauthorized.
+    - The client secret remains server-side.
+
 
 ================================================================================
-12. SECURITY NOTES
+14. SECURITY NOTES
 ================================================================================
 
-Rule 1 — Keycloak owns authentication
+RULE 1 — Keycloak owns authentication
 
-  Laravel never stores passwords, never sees passwords, and never
-  validates passwords. All of that belongs to Keycloak.
+Laravel does not authenticate the user's password.
 
-Rule 2 — Laravel owns authorization
+Keycloak does.
 
-  Roles, permissions, and business data belong to this API. They are
-  the reason a local user table exists.
 
-Rule 3 — Decode is not validate
+RULE 2 — Laravel owns application authorization
 
-  If Laravel receives a JWT, decoding it does not prove authenticity.
-  Signature verification via the IdP's JWKS is required. The OIDC
-  package handles this automatically.
+Laravel decides whether an authenticated user is allowed to perform an
+application action.
 
-Rule 4 — 401 vs 403
+Do not trust the Nuxt SPA to enforce authorization.
 
-  401 Unauthorized = "We cannot establish who you are."
-  403 Forbidden    = "We know who you are. You are not allowed to do this."
 
-  A 403 after a successful SSO login is not a bug. It means
-  authentication worked and the authorization layer did its job.
+RULE 3 — The authorization code is not a token
 
-Rule 5 — Do not trust the frontend
+The temporary authorization code is exchanged with Keycloak.
 
-  The Nuxt SPA does not tell Laravel who the user is. It sends a
-  session cookie. Laravel independently resolves the user from that.
+The SPA must not treat it as an access token.
 
-Rule 6 — Keep the client secret secret
+The code should be:
 
-  The OIDC_CLIENT_SECRET must live only in the API's .env. Never ship
-  it to the browser. Never commit it to version control.
+    short-lived
+    single-use
+    exchanged immediately
 
-Rule 7 — Session cookies must be HttpOnly and Secure
 
-  In production, SESSION_SECURE_COOKIE=true and the session cookie is
-  HttpOnly (default). Together these prevent JavaScript access and
-  require HTTPS.
+RULE 4 — OIDC tokens remain server-side
+
+After Laravel exchanges the authorization code, token responses remain
+server-side.
+
+Never return them to Nuxt.
+
+
+RULE 5 — Decode is not validate
+
+Decoding a JWT does not prove that it is authentic.
+
+OIDC token validation must verify the appropriate signatures, issuer,
+audience, expiry, nonce/state/PKCE requirements as applicable to the flow.
+
+
+RULE 6 — Never trust the frontend
+
+The SPA does not tell Laravel:
+
+    "I am user 123."
+
+Instead, Laravel determines the authenticated user from the server-side
+session.
+
+
+RULE 7 — 401 vs 403
+
+    401 Unauthorized
+
+means:
+
+    The request is not authenticated.
+
+
+    403 Forbidden
+
+means:
+
+    The request is authenticated, but the user is not allowed to perform
+    the requested operation.
+
+
+RULE 8 — Keep the client secret secret
+
+The following value must never reach Nuxt:
+
+    OIDC_CLIENT_SECRET
+
+
+It belongs only on the Laravel server.
+
+
+RULE 9 — Do not store authentication state in localStorage
+
+Do not put:
+
+    access tokens
+    refresh tokens
+    ID tokens
+    client secrets
+
+into localStorage or sessionStorage.
+
+
+RULE 10 — Session cookies should be protected
+
+Production should use:
+
+    HttpOnly
+    Secure
+    appropriate SameSite policy
+
+
+RULE 11 — Do not mix hosts
+
+During development choose:
+
+    localhost
+
+and use it consistently.
+
+Do not alternate between:
+
+    localhost
+
+and:
+
+    127.0.0.1
+
+
+RULE 12 — Logout must terminate both sessions
+
+Application logout should clear:
+
+    Laravel session
+
+and, where federated logout is enabled:
+
+    Keycloak SSO session
+
 
 ================================================================================
-13. RELATED PROJECTS
+15. RELATED PROJECTS
 ================================================================================
 
-  bakery-spa      Nuxt 4 SPA that consumes this API.
-                  Delegates all authentication. Never handles tokens.
-                  See its README for full frontend setup.
+bakery-spa
 
-  Keycloak        The Identity Provider. Realm "myapp", confidential
-                  client "nuxt-laravel-bakery". See the project
-                  documentation for the Keycloak setup.
+    Nuxt 4 frontend for this API.
+
+    Responsibilities:
+
+        - Render the UI.
+        - Start login navigation.
+        - Receive the authorization callback.
+        - Send the authorization code to Laravel.
+        - Maintain client-side authentication state.
+        - Call /api/user.
+        - Call /api/logout.
+
+    The SPA does not communicate directly with Keycloak.
+
+
+Keycloak
+
+    Identity Provider.
+
+    Realm:
+
+        myapp
+
+    Client:
+
+        nuxt-laravel-bakery
+
+    Responsibilities:
+
+        - Authenticate users.
+        - Store passwords.
+        - Maintain the SSO session.
+        - Provide the OIDC identity.
+        - Perform federated logout.
+
 
 ================================================================================
-14. AUTHOR
+16. AUTHOR
 ================================================================================
 
-This project was developed by **Tochukwu Uchem**.
+This project was developed by Tochukwu Uchem.
 
-- **Github:** https://github.com/uchemcolin
-- **Linkedin:** https://www.linkedin.com/in/tochukwu-uchem-802888144/
-- **Gitlab:** https://gitlab.com/uchemcolin
+Github:
+
+    https://github.com/uchemcolin
+
+Linkedin:
+
+    https://www.linkedin.com/in/tochukwu-uchem-802888144/
+
+Gitlab:
+
+    https://gitlab.com/uchemcolin
+
 
 ================================================================================
 END OF DOCUMENT
